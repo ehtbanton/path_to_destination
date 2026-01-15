@@ -262,8 +262,8 @@ class Path:
         to_obstacle_y = obstacle_center[1] - start_pos[1]
         cross = dx * to_obstacle_y - dy * to_obstacle_x
 
-        # Choose side based on cross product sign
-        side = 1 if cross > 0 else -1
+        # Choose side based on cross product sign (flipped for correct direction)
+        side = -1 if cross > 0 else 1
 
         # Calculate avoidance point: beside the obstacle
         avoidance_x = obstacle_center[0] + side * perp_x * (max_extent + margin)
