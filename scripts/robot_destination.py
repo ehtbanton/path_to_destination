@@ -7,11 +7,120 @@ Features:
 - Both sprites are draggable at all times
 - Start/Stop button to control robot movement
 - Speed slider to adjust robot speed
+- Path computation with dotted line visualization
 """
 
 import pygame
 import math
 from engine import Game, Sprite, Colors
+
+
+class Path:
+    """
+    Computes and manages a path from start to end point.
+
+    The path is represented as a list of waypoints that can be followed.
+    This architecture supports future enhancements like curved paths,
+    obstacle avoidance, or dynamic path modifications.
+    """
+
+    def __init__(self):
+        self.waypoints = []  # List of (x, y) tuples
+        self.dot_spacing = 20  # Pixels between dots
+        self.dot_radius = 3
+        self.dot_color = Colors.YELLOW
+
+    def compute(self, start_pos, end_pos):
+        """
+        Compute the path from start to end position.
+
+        Currently computes a straight line, but this method can be
+        overridden or modified to compute more complex paths.
+
+        Args:
+            start_pos: (x, y) tuple for starting position
+            end_pos: (x, y) tuple for ending position
+        """
+        self.waypoints = self._compute_straight_line(start_pos, end_pos)
+
+    def _compute_straight_line(self, start_pos, end_pos):
+        """
+        Compute waypoints along a straight line.
+
+        Args:
+            start_pos: (x, y) tuple for starting position
+            end_pos: (x, y) tuple for ending position
+
+        Returns:
+            List of (x, y) waypoint tuples
+        """
+        waypoints = []
+
+        dx = end_pos[0] - start_pos[0]
+        dy = end_pos[1] - start_pos[1]
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        if distance < 1:
+            return [end_pos]
+
+        # Normalize direction
+        dir_x = dx / distance
+        dir_y = dy / distance
+
+        # Generate waypoints along the line
+        num_points = max(2, int(distance / self.dot_spacing))
+        for i in range(num_points + 1):
+            t = i / num_points
+            x = start_pos[0] + dx * t
+            y = start_pos[1] + dy * t
+            waypoints.append((x, y))
+
+        return waypoints
+
+    def get_next_waypoint(self, current_pos, threshold=10):
+        """
+        Get the next waypoint to move towards.
+
+        Args:
+            current_pos: Current (x, y) position
+            threshold: Distance threshold to consider a waypoint reached
+
+        Returns:
+            Next waypoint (x, y) or None if path is complete
+        """
+        if not self.waypoints:
+            return None
+
+        # Find the first waypoint that hasn't been reached yet
+        for waypoint in self.waypoints:
+            dx = waypoint[0] - current_pos[0]
+            dy = waypoint[1] - current_pos[1]
+            distance = math.sqrt(dx * dx + dy * dy)
+            if distance > threshold:
+                return waypoint
+
+        # All waypoints reached, return the final one
+        return self.waypoints[-1] if self.waypoints else None
+
+    def draw(self, screen):
+        """Draw the path as a dotted line."""
+        for waypoint in self.waypoints:
+            pygame.draw.circle(
+                screen,
+                self.dot_color,
+                (int(waypoint[0]), int(waypoint[1])),
+                self.dot_radius
+            )
+
+    def is_complete(self, current_pos, threshold=10):
+        """Check if the path has been completed."""
+        if not self.waypoints:
+            return True
+
+        final = self.waypoints[-1]
+        dx = final[0] - current_pos[0]
+        dy = final[1] - current_pos[1]
+        return math.sqrt(dx * dx + dy * dy) <= threshold
 
 
 class CircleSprite(Sprite):
@@ -62,7 +171,7 @@ class CircleSprite(Sprite):
 
 
 class Robot(CircleSprite):
-    """The blue robot circle that moves towards the destination."""
+    """The blue robot circle that follows a computed path to the destination."""
 
     def __init__(self, x, y, radius=30):
         super().__init__(x, y, radius, Colors.BLUE)
@@ -70,18 +179,61 @@ class Robot(CircleSprite):
         self.moving = False
         self.speed = 100
         self.destination = None
+        self.path = Path()
+        self._last_robot_pos = None
+        self._last_dest_pos = None
+
+    def update_path(self):
+        """Recompute the path if robot or destination has moved."""
+        if self.destination is None:
+            return
+
+        current_robot_pos = self.center
+        current_dest_pos = self.destination.center
+
+        # Check if positions have changed significantly
+        needs_update = False
+
+        if self._last_robot_pos is None or self._last_dest_pos is None:
+            needs_update = True
+        else:
+            robot_moved = (
+                abs(current_robot_pos[0] - self._last_robot_pos[0]) > 5 or
+                abs(current_robot_pos[1] - self._last_robot_pos[1]) > 5
+            )
+            dest_moved = (
+                abs(current_dest_pos[0] - self._last_dest_pos[0]) > 5 or
+                abs(current_dest_pos[1] - self._last_dest_pos[1]) > 5
+            )
+            needs_update = robot_moved or dest_moved
+
+        if needs_update:
+            self.path.compute(current_robot_pos, current_dest_pos)
+            self._last_robot_pos = current_robot_pos
+            self._last_dest_pos = current_dest_pos
 
     def on_update(self, dt):
-        if self.moving and self.destination and not self.dragging:
-            # Calculate direction to destination
-            dx = self.destination.center[0] - self.center[0]
-            dy = self.destination.center[1] - self.center[1]
-            distance = math.sqrt(dx * dx + dy * dy)
+        # Always update path when positions change
+        self.update_path()
 
-            if distance > 5:  # Stop when close enough
-                # Normalize and apply speed
-                self.x += (dx / distance) * self.speed * dt
-                self.y += (dy / distance) * self.speed * dt
+        if self.moving and self.destination and not self.dragging:
+            # Get next waypoint from path
+            next_waypoint = self.path.get_next_waypoint(self.center)
+
+            if next_waypoint and not self.path.is_complete(self.center):
+                # Calculate direction to next waypoint
+                dx = next_waypoint[0] - self.center[0]
+                dy = next_waypoint[1] - self.center[1]
+                distance = math.sqrt(dx * dx + dy * dy)
+
+                if distance > 5:
+                    # Normalize and apply speed
+                    self.x += (dx / distance) * self.speed * dt
+                    self.y += (dy / distance) * self.speed * dt
+
+    def draw_path(self, screen):
+        """Draw the path visualization."""
+        self.path.draw(screen)
 
 
 class Destination(CircleSprite):
@@ -242,8 +394,9 @@ class RobotDestinationGame(Game):
 
         print("Robot Destination Game")
         print("- Drag the blue robot or green destination anywhere")
-        print("- Click Start to make the robot move towards the destination")
+        print("- Click Start to make the robot follow the path")
         print("- Use the slider to adjust robot speed")
+        print("- Path updates dynamically as you drag!")
 
     def on_update(self, dt):
         mouse_pos = pygame.mouse.get_pos()
@@ -262,6 +415,9 @@ class RobotDestinationGame(Game):
             self.dragged_sprite.update_drag(mouse_pos)
 
     def on_draw(self, screen):
+        # Draw path first (behind everything)
+        self.robot.draw_path(screen)
+
         # Draw button
         self.button.draw(screen)
 
@@ -330,6 +486,10 @@ class RobotDestinationGame(Game):
 
             # Draw
             self._screen.fill(self.background_color)
+
+            # Draw path before sprites
+            self.robot.draw_path(self._screen)
+
             for sprite in self._sprites:
                 sprite._draw(self._screen)
             self.on_draw(self._screen)
