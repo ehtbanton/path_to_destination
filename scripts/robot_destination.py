@@ -6,8 +6,9 @@ Features:
 - Blue circle (robot) that faces movement direction with 70-degree FOV vision
 - Green circle (destination) as the target
 - Red rectangle obstacle (draggable, resizable, rotatable)
-- Path avoidance when FOV detects obstacle
-- Start/Stop button and speed slider
+- Proximity cloud in FOV with inverse distance values
+- Diversion point that moves perpendicular based on obstacle overlap
+- Start/Stop button and parameter sliders
 """
 
 import pygame
@@ -36,6 +37,138 @@ def meters_to_pixels(meters):
 def pixels_to_meters(pixels):
     """Convert pixels to meters."""
     return pixels / PPM
+
+
+class ProximityPoint:
+    """A single point in the proximity cloud with an inverse distance value."""
+
+    def __init__(self, relative_angle, relative_distance, is_left_side):
+        # Store relative position (angle offset and distance from robot)
+        self.relative_angle = relative_angle  # Angle offset from facing direction
+        self.relative_distance = relative_distance  # Distance from robot center
+        self.is_left_side = is_left_side
+
+        # World position (updated each frame)
+        self.x = 0
+        self.y = 0
+
+        # Proximity value (1/distance), negated if on left side
+        self.base_proximity = 1.0 / max(relative_distance, 1)
+        self.proximity = -self.base_proximity if is_left_side else self.base_proximity
+
+        # Whether this point overlaps with obstacle
+        self.overlapping = False
+
+    @property
+    def position(self):
+        return (self.x, self.y)
+
+    def update_world_position(self, robot_center, facing_angle):
+        """Update world position based on robot position and facing."""
+        angle_rad = math.radians(facing_angle) + math.radians(self.relative_angle)
+        self.x = robot_center[0] + self.relative_distance * math.cos(angle_rad)
+        self.y = robot_center[1] + self.relative_distance * math.sin(angle_rad)
+
+
+class ProximityCloud:
+    """
+    A static cloud of proximity points within the FOV triangle.
+    Each point has a fixed relative position and a value of 1/distance (inverse distance).
+    Points on the left of the facing direction are negated.
+    """
+
+    def __init__(self, num_points=50):
+        self.num_points = num_points
+        self.points = []
+        self.min_distance = meters_to_pixels(0.3)
+        self._initialized = False
+        self._last_fov_angle = None
+        self._last_fov_range = None
+
+    def _initialize_points(self, fov_angle, fov_range):
+        """Initialize the static grid of points within the FOV."""
+        self.points = []
+        half_angle = fov_angle / 2
+
+        # Create a grid pattern within the FOV triangle
+        # Use rows at different distances, with points spread across the angle
+        num_rows = max(3, int(math.sqrt(self.num_points)))
+
+        for row in range(num_rows):
+            # Distance increases with each row (from min to fov_range)
+            t = (row + 1) / num_rows
+            distance = self.min_distance + t * (fov_range - self.min_distance)
+
+            # Number of points in this row (more points at greater distances)
+            points_in_row = max(3, int(self.num_points / num_rows))
+
+            for i in range(points_in_row):
+                # Spread points across the FOV angle
+                angle_t = (i + 0.5) / points_in_row  # 0 to 1
+                angle_offset = -half_angle + angle_t * (2 * half_angle)
+
+                is_left_side = angle_offset < 0
+
+                point = ProximityPoint(angle_offset, distance, is_left_side)
+                self.points.append(point)
+
+        self._initialized = True
+        self._last_fov_angle = fov_angle
+        self._last_fov_range = fov_range
+
+    def generate(self, robot_center, facing_angle, fov_angle, fov_range):
+        """Update point positions based on robot state."""
+        # Reinitialize if FOV parameters changed or first time
+        if (not self._initialized or
+            self._last_fov_angle != fov_angle or
+            self._last_fov_range != fov_range):
+            self._initialize_points(fov_angle, fov_range)
+
+        # Update world positions of all points
+        for point in self.points:
+            point.update_world_position(robot_center, facing_angle)
+
+    def get_obstacle_overlap_sum(self, obstacle):
+        """
+        Calculate the sum of proximity values for points that overlap with the obstacle.
+        Returns a signed value: positive means obstacle is on right, negative means left.
+        """
+        if obstacle is None:
+            return 0.0
+
+        total = 0.0
+        for point in self.points:
+            point.overlapping = obstacle.contains_point(point.position)
+            if point.overlapping:
+                total += point.proximity
+
+        return total
+
+    def draw(self, screen, show_values=True):
+        """Draw the proximity cloud with static visual indicators."""
+        # Create a surface for transparency
+        cloud_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+
+        for point in self.points:
+            # Base alpha on proximity (closer = more opaque)
+            base_alpha = min(200, int(point.base_proximity * 3000))
+
+            # Color based on side (red for left, green for right)
+            if point.is_left_side:
+                color = (200, 60, 60, base_alpha)  # Red for left side
+            else:
+                color = (60, 200, 60, base_alpha)  # Green for right side
+
+            # Highlight if overlapping with obstacle
+            if point.overlapping:
+                color = (255, 255, 0, 220)  # Bright yellow when overlapping
+
+            # Size based on proximity (closer = larger)
+            size = max(3, min(10, int(point.base_proximity * 500)))
+
+            pygame.draw.circle(cloud_surface, color, (int(point.x), int(point.y)), size)
+
+        screen.blit(cloud_surface, (0, 0))
 
 
 class Obstacle(Sprite):
@@ -202,7 +335,7 @@ class Obstacle(Sprite):
 
 class Path:
     """
-    Computes and manages a path from start to end point with obstacle avoidance.
+    Computes and manages a path from start to end point via a diversion point.
     """
 
     def __init__(self):
@@ -210,72 +343,21 @@ class Path:
         self.dot_spacing = meters_to_pixels(0.5)  # 0.5m between dots
         self.dot_radius = 4
         self.dot_color = Colors.YELLOW
-        self.obstacle = None
-        self.avoidance_point = None  # The intermediate point to go around obstacle
 
-    def compute(self, start_pos, end_pos, obstacle=None, fov_sees_obstacle=False):
+    def compute(self, start_pos, end_pos, diversion_point=None):
         """
-        Compute the path from start to end position, avoiding obstacle if detected.
+        Compute the path from start to end position, going through diversion point.
         """
-        self.obstacle = obstacle
-
-        if fov_sees_obstacle and obstacle is not None:
-            # Compute 2-segment avoidance path
-            self.waypoints = self._compute_avoidance_path(start_pos, end_pos, obstacle)
+        if diversion_point is not None:
+            # Path goes: start -> diversion -> end
+            diversion_pos = diversion_point.center
+            segment1 = self._compute_straight_line(start_pos, diversion_pos)
+            segment2 = self._compute_straight_line(diversion_pos, end_pos)
+            # Combine segments (remove duplicate point at junction)
+            self.waypoints = segment1 + segment2[1:]
         else:
             # Direct path
             self.waypoints = self._compute_straight_line(start_pos, end_pos)
-            self.avoidance_point = None
-
-    def _compute_avoidance_path(self, start_pos, end_pos, obstacle):
-        """Compute a 2-segment path that goes around the obstacle."""
-        # Get obstacle corners and center
-        obstacle_center = obstacle.center
-        corners = obstacle.get_corners()
-
-        # Calculate direction from start to end
-        dx = end_pos[0] - start_pos[0]
-        dy = end_pos[1] - start_pos[1]
-
-        # Calculate perpendicular direction (for going around)
-        perp_x = -dy
-        perp_y = dx
-        perp_len = math.sqrt(perp_x * perp_x + perp_y * perp_y)
-        if perp_len > 0:
-            perp_x /= perp_len
-            perp_y /= perp_len
-
-        # Find which side to go around (left or right of the obstacle)
-        # Check which side has more clearance
-        margin = meters_to_pixels(1.0)  # 1m margin around obstacle
-
-        # Calculate bounding box extents in the perpendicular direction
-        max_extent = 0
-        for corner in corners:
-            cx, cy = corner[0] - obstacle_center[0], corner[1] - obstacle_center[1]
-            extent = abs(cx * perp_x + cy * perp_y)
-            max_extent = max(max_extent, extent)
-
-        # Determine which side to go (based on cross product to see which is shorter)
-        # Use cross product of (start->obstacle) and (start->end) to determine side
-        to_obstacle_x = obstacle_center[0] - start_pos[0]
-        to_obstacle_y = obstacle_center[1] - start_pos[1]
-        cross = dx * to_obstacle_y - dy * to_obstacle_x
-
-        # Choose side based on cross product sign (flipped for correct direction)
-        side = -1 if cross > 0 else 1
-
-        # Calculate avoidance point: beside the obstacle
-        avoidance_x = obstacle_center[0] + side * perp_x * (max_extent + margin)
-        avoidance_y = obstacle_center[1] + side * perp_y * (max_extent + margin)
-        self.avoidance_point = (avoidance_x, avoidance_y)
-
-        # Generate waypoints for both segments
-        segment1 = self._compute_straight_line(start_pos, self.avoidance_point)
-        segment2 = self._compute_straight_line(self.avoidance_point, end_pos)
-
-        # Combine segments (remove duplicate point at junction)
-        return segment1 + segment2[1:]
 
     def _compute_straight_line(self, start_pos, end_pos):
         """Compute waypoints along a straight line."""
@@ -385,6 +467,130 @@ class CircleSprite(Sprite):
             self.y = mouse_pos[1] + self.drag_offset_y
 
 
+class DiversionPoint(CircleSprite):
+    """
+    A sprite that represents the diversion point for obstacle avoidance.
+    Stays still by default, moves perpendicular to robot facing based on proximity overlap.
+    Positioned along the path ahead of the robot.
+    """
+
+    def __init__(self, x, y, radius=None):
+        if radius is None:
+            radius = meters_to_pixels(0.3)
+        super().__init__(x, y, radius, Colors.ORANGE)
+        self.tag = "diversion"
+        self.base_speed = meters_to_pixels(10.0)  # Base movement speed (5x faster)
+        self.overlap_sum = 0.0  # Current proximity overlap value
+        self.robot_facing = 0  # Robot's facing angle
+        self.sensitivity = 1.0  # Sensitivity multiplier for movement
+        self.active = False  # Whether diversion is active (obstacle detected)
+        self.damping = 0.95  # Velocity damping when no overlap
+        self.velocity_x = 0
+        self.velocity_y = 0
+        self.lead_distance = meters_to_pixels(3.0)  # How far ahead of robot to position
+        self.perpendicular_offset = 0  # Accumulated perpendicular offset from path
+
+    def update_from_overlap(self, overlap_sum, robot_facing, robot_center, destination_center, dt):
+        """Update position based on proximity overlap sum."""
+        self.overlap_sum = overlap_sum
+        self.robot_facing = robot_facing
+
+        # Calculate direction from robot to destination
+        dx = destination_center[0] - robot_center[0]
+        dy = destination_center[1] - robot_center[1]
+        dist_to_dest = math.sqrt(dx * dx + dy * dy)
+
+        if dist_to_dest > 1:
+            # Normalize direction
+            dir_x = dx / dist_to_dest
+            dir_y = dy / dist_to_dest
+
+            # Base position: lead_distance ahead of robot along path to destination
+            # But cap it so it doesn't go past the destination
+            actual_lead = min(self.lead_distance, dist_to_dest * 0.8)
+            base_x = robot_center[0] + dir_x * actual_lead
+            base_y = robot_center[1] + dir_y * actual_lead
+
+            # Perpendicular direction (90 degrees to the path)
+            perp_x = -dir_y
+            perp_y = dir_x
+
+            if abs(overlap_sum) > 0.001:
+                self.active = True
+
+                # Speed proportional to overlap sum magnitude
+                speed = self.base_speed * abs(overlap_sum) * self.sensitivity
+
+                # Direction based on sign of overlap
+                # Negative overlap (obstacle on left) -> move right (positive perpendicular)
+                # Positive overlap (obstacle on right) -> move left (negative perpendicular)
+                direction = -1 if overlap_sum > 0 else 1
+
+                # Accumulate perpendicular offset
+                self.perpendicular_offset += direction * speed * dt
+            else:
+                # Dampen perpendicular offset back towards zero when no overlap
+                self.perpendicular_offset *= self.damping
+
+                if abs(self.perpendicular_offset) < 1:
+                    self.active = False
+                    self.perpendicular_offset = 0
+
+            # Final position: base position + perpendicular offset
+            final_x = base_x + perp_x * self.perpendicular_offset
+            final_y = base_y + perp_y * self.perpendicular_offset
+
+            # Set position (adjusting for sprite origin being top-left)
+            self.x = final_x - self.radius
+            self.y = final_y - self.radius
+
+    def reset_to_path(self, robot_center, destination_center):
+        """Reset position to be along the path ahead of the robot."""
+        dx = destination_center[0] - robot_center[0]
+        dy = destination_center[1] - robot_center[1]
+        dist_to_dest = math.sqrt(dx * dx + dy * dy)
+
+        if dist_to_dest > 1:
+            dir_x = dx / dist_to_dest
+            dir_y = dy / dist_to_dest
+            actual_lead = min(self.lead_distance, dist_to_dest * 0.8)
+
+            self.x = robot_center[0] + dir_x * actual_lead - self.radius
+            self.y = robot_center[1] + dir_y * actual_lead - self.radius
+
+        self.perpendicular_offset = 0
+        self.active = False
+
+    def draw_diversion(self, screen):
+        """Draw the diversion point with indicator."""
+        cx, cy = self.center
+        int_cx, int_cy = int(cx), int(cy)
+        int_radius = int(self.radius)
+
+        # Draw outer ring - color indicates state
+        if self.active:
+            ring_color = Colors.YELLOW
+        else:
+            ring_color = Colors.ORANGE
+        pygame.draw.circle(screen, ring_color, (int_cx, int_cy), int_radius + 4, 3)
+
+        # Draw inner circle
+        pygame.draw.circle(screen, Colors.ORANGE, (int_cx, int_cy), int_radius)
+        pygame.draw.circle(screen, Colors.WHITE, (int_cx, int_cy), int_radius, 2)
+
+        # Draw offset indicator showing perpendicular displacement
+        if abs(self.perpendicular_offset) > 5:
+            # Draw a small bar showing the offset magnitude
+            bar_length = min(30, abs(self.perpendicular_offset) * 0.3)
+            bar_color = Colors.CYAN if self.perpendicular_offset > 0 else Colors.MAGENTA
+            pygame.draw.circle(screen, bar_color, (int_cx, int_cy), int(bar_length / 3) + 2)
+
+    def _draw(self, screen):
+        """Override to use custom drawing."""
+        if self.visible:
+            self.draw_diversion(screen)
+
+
 class Robot(CircleSprite):
     """The blue robot circle with FOV vision that follows a computed path."""
 
@@ -403,9 +609,12 @@ class Robot(CircleSprite):
         self.path = Path()
         self.facing_angle = 0  # Degrees, 0 = right, 90 = down
         self.fov_sees_obstacle = False
-        self._last_robot_pos = None
-        self._last_dest_pos = None
-        self._last_obstacle_state = None
+
+        # Proximity cloud for obstacle detection
+        self.proximity_cloud = ProximityCloud(num_points=100)
+        self.diversion_point = None  # Will be set by game
+        self.overlap_sum = 0.0  # Current overlap value for display
+        self.show_proximity_cloud = True  # Toggle for visibility
 
     def get_fov_triangle(self):
         """Get the three points of the FOV vision triangle."""
@@ -495,73 +704,60 @@ class Robot(CircleSprite):
         return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
 
     def update_path(self):
-        """Recompute the path if needed."""
+        """Recompute the path through diversion point."""
         if self.destination is None:
             return
 
-        current_robot_pos = self.center
-        current_dest_pos = self.destination.center
+        # Path always goes through diversion point: robot -> diversion -> destination
+        self.path.compute(
+            self.center,
+            self.destination.center,
+            self.diversion_point
+        )
 
-        # Check obstacle state
-        obstacle_state = None
-        if self.obstacle:
-            obstacle_state = (
-                self.obstacle.center,
-                self.obstacle.width,
-                self.obstacle.height,
-                self.obstacle.angle
-            )
-
-        # Check if anything has changed
-        needs_update = False
-
-        if self._last_robot_pos is None or self._last_dest_pos is None:
-            needs_update = True
-        else:
-            robot_moved = (
-                abs(current_robot_pos[0] - self._last_robot_pos[0]) > 5 or
-                abs(current_robot_pos[1] - self._last_robot_pos[1]) > 5
-            )
-            dest_moved = (
-                abs(current_dest_pos[0] - self._last_dest_pos[0]) > 5 or
-                abs(current_dest_pos[1] - self._last_dest_pos[1]) > 5
-            )
-            obstacle_changed = obstacle_state != self._last_obstacle_state
-            needs_update = robot_moved or dest_moved or obstacle_changed
-
-        if needs_update:
-            # Check FOV collision
-            self.fov_sees_obstacle = self.check_fov_obstacle_collision(self.obstacle)
-
-            # Compute path with avoidance if needed
-            self.path.compute(
-                current_robot_pos,
-                current_dest_pos,
-                self.obstacle,
-                self.fov_sees_obstacle
-            )
-
-            self._last_robot_pos = current_robot_pos
-            self._last_dest_pos = current_dest_pos
-            self._last_obstacle_state = obstacle_state
+        # Also check FOV collision for visual feedback
+        self.fov_sees_obstacle = self.check_fov_obstacle_collision(self.obstacle)
 
     def on_update(self, dt):
-        # Always update path when positions change
+        # Generate proximity cloud in FOV
+        fov_range = meters_to_pixels(self.FOV_RANGE_METERS)
+        self.proximity_cloud.generate(
+            self.center,
+            self.facing_angle,
+            self.FOV_ANGLE,
+            fov_range
+        )
+
+        # Calculate overlap sum with obstacle
+        self.overlap_sum = self.proximity_cloud.get_obstacle_overlap_sum(self.obstacle)
+
+        # Update diversion point based on overlap
+        if self.diversion_point is not None and self.destination is not None:
+            self.diversion_point.update_from_overlap(
+                self.overlap_sum,
+                self.facing_angle,
+                self.center,
+                self.destination.center,
+                dt
+            )
+
+        # Update path to go through diversion point
         self.update_path()
 
         if self.moving and self.destination and not self.dragging:
-            next_waypoint = self.path.get_next_waypoint(self.center)
+            # Always follow the path (which goes through diversion point)
+            target = self.path.get_next_waypoint(self.center)
 
-            if next_waypoint and not self.path.is_complete(self.center):
-                dx = next_waypoint[0] - self.center[0]
-                dy = next_waypoint[1] - self.center[1]
+            if target and not self.path.is_complete(self.center):
+                dx = target[0] - self.center[0]
+                dy = target[1] - self.center[1]
                 distance = math.sqrt(dx * dx + dy * dy)
 
                 if distance > meters_to_pixels(0.1):
                     # Update facing angle based on movement direction
                     self.facing_angle = math.degrees(math.atan2(dy, dx))
 
-                    # Move towards waypoint
+                    # Move towards target
                     self.x += (dx / distance) * self.speed * dt
                     self.y += (dy / distance) * self.speed * dt
         elif not self.moving and self.destination:
@@ -572,7 +768,7 @@ class Robot(CircleSprite):
                 self.facing_angle = math.degrees(math.atan2(dy, dx))
 
     def draw_fov(self, screen):
-        """Draw the FOV vision triangle."""
+        """Draw the FOV vision triangle and proximity cloud."""
         fov_triangle = self.get_fov_triangle()
 
         # Create translucent surface for FOV
@@ -580,9 +776,9 @@ class Robot(CircleSprite):
 
         # Choose color based on whether obstacle is detected
         if self.fov_sees_obstacle:
-            fov_color = (255, 100, 100, 80)  # Red tint when seeing obstacle
+            fov_color = (255, 100, 100, 40)  # Red tint when seeing obstacle (reduced alpha)
         else:
-            fov_color = (100, 200, 255, 80)  # Blue tint normally
+            fov_color = (100, 200, 255, 40)  # Blue tint normally (reduced alpha)
 
         # Draw filled triangle
         int_triangle = [(int(p[0]), int(p[1])) for p in fov_triangle]
@@ -593,6 +789,10 @@ class Robot(CircleSprite):
         pygame.draw.polygon(fov_surface, outline_color, int_triangle, 2)
 
         screen.blit(fov_surface, (0, 0))
+
+        # Draw proximity cloud on top
+        if self.show_proximity_cloud:
+            self.proximity_cloud.draw(screen)
 
     def draw_robot(self, screen):
         """Draw the robot with facing direction indicator."""
@@ -750,8 +950,9 @@ class RobotDestinationGame(Game):
         self.robot = None
         self.destination = None
         self.obstacle = None
+        self.diversion_point = None
         self.button = None
-        self.slider = None
+        self.sliders = []  # List of all sliders
         self.is_moving = False
         self.dragged_sprite = None
 
@@ -776,9 +977,14 @@ class RobotDestinationGame(Game):
         self.obstacle = Obstacle(obs_x, obs_y)
         self.add(self.obstacle)
 
-        # Link robot to destination and obstacle
+        # Create diversion point (will be positioned along path to destination)
+        self.diversion_point = DiversionPoint(0, 0)
+        self.add(self.diversion_point)
+
+        # Link robot to destination, obstacle, and diversion point
         self.robot.destination = self.destination
         self.robot.obstacle = self.obstacle
+        self.robot.diversion_point = self.diversion_point
 
         # Create UI elements
         self.button = Button(
@@ -786,27 +992,84 @@ class RobotDestinationGame(Game):
             "Start", Colors.GREEN, (0, 200, 0)
         )
 
-        # Speed slider in m/s
-        self.slider = Slider(
-            self.width // 2 - 100, self.height - 50,
-            200, 20, 0.5, 8.0, 2.0, "Speed", " m/s"
-        )
+        # Create sliders for adjustable parameters
+        slider_width = 150
+        slider_height = 16
+        left_x = 15
+        right_x = self.width - slider_width - 15
 
-        print("Robot Destination Game (32m x 18m space)")
+        # Left side sliders
+        self.speed_slider = Slider(
+            left_x, 80, slider_width, slider_height,
+            0.5, 8.0, 2.0, "Speed", " m/s"
+        )
+        self.sliders.append(self.speed_slider)
+
+        self.sensitivity_slider = Slider(
+            left_x, 130, slider_width, slider_height,
+            0.1, 5.0, 1.0, "Sensitivity", "x"
+        )
+        self.sliders.append(self.sensitivity_slider)
+
+        self.damping_slider = Slider(
+            left_x, 180, slider_width, slider_height,
+            0.8, 0.99, 0.95, "Damping", ""
+        )
+        self.sliders.append(self.damping_slider)
+
+        # Right side sliders
+        self.fov_angle_slider = Slider(
+            right_x, 80, slider_width, slider_height,
+            30, 120, 70, "FOV Angle", "°"
+        )
+        self.sliders.append(self.fov_angle_slider)
+
+        self.fov_range_slider = Slider(
+            right_x, 130, slider_width, slider_height,
+            1.0, 10.0, 4.0, "FOV Range", " m"
+        )
+        self.sliders.append(self.fov_range_slider)
+
+        self.num_points_slider = Slider(
+            right_x, 180, slider_width, slider_height,
+            20, 200, 100, "Points", ""
+        )
+        self.sliders.append(self.num_points_slider)
+
+        self.lead_dist_slider = Slider(
+            right_x, 230, slider_width, slider_height,
+            1.0, 8.0, 3.0, "Lead Dist", " m"
+        )
+        self.sliders.append(self.lead_dist_slider)
+
+        # Initialize diversion point position
+        self.diversion_point.reset_to_path(self.robot.center, self.destination.center)
+
+        print("Robot Destination Game with Proximity Cloud Navigation")
         print("- Drag the blue robot or green destination anywhere")
         print("- Drag the red obstacle to move it, drag corners to resize")
+        print("- Orange diversion point moves perpendicular to avoid obstacles")
+        print("- Green dots = right side proximity, Red dots = left side")
         print("- Mouse wheel over obstacle to rotate it")
-        print("- Robot has 70-degree FOV with 4m range")
-        print("- Path avoids obstacle when detected in FOV")
 
     def on_update(self, dt):
         mouse_pos = pygame.mouse.get_pos()
 
         self.button.update(mouse_pos)
-        self.slider.handle_mouse_move(mouse_pos)
 
-        # Update robot speed from slider (convert m/s to pixels/s)
-        self.robot.speed = meters_to_pixels(self.slider.value)
+        # Update all sliders
+        for slider in self.sliders:
+            slider.handle_mouse_move(mouse_pos)
+
+        # Apply slider values to robot and diversion point
+        self.robot.speed = meters_to_pixels(self.speed_slider.value)
+        self.robot.FOV_ANGLE = self.fov_angle_slider.value
+        self.robot.FOV_RANGE_METERS = self.fov_range_slider.value
+        self.robot.proximity_cloud.num_points = int(self.num_points_slider.value)
+
+        self.diversion_point.sensitivity = self.sensitivity_slider.value
+        self.diversion_point.damping = self.damping_slider.value
+        self.diversion_point.lead_distance = meters_to_pixels(self.lead_dist_slider.value)
 
         if self.dragged_sprite:
             self.dragged_sprite.update_drag(mouse_pos)
@@ -821,16 +1084,31 @@ class RobotDestinationGame(Game):
         # Draw button
         self.button.draw(screen)
 
-        # Draw slider
-        self.slider.draw(screen)
+        # Draw all sliders
+        for slider in self.sliders:
+            slider.draw(screen)
+
+        # Draw overlap sum indicator (visual feedback)
+        font = pygame.font.Font(None, 24)
+        overlap_color = Colors.RED if self.robot.overlap_sum < 0 else Colors.GREEN
+        if abs(self.robot.overlap_sum) < 0.001:
+            overlap_color = Colors.WHITE
+        overlap_text = font.render(f"Overlap: {self.robot.overlap_sum:.4f}", True, overlap_color)
+        screen.blit(overlap_text, (self.width // 2 - 60, 70))
+
+        # Draw diversion status
+        status = "ACTIVE" if self.diversion_point.active else "IDLE"
+        status_color = Colors.YELLOW if self.diversion_point.active else Colors.GRAY
+        status_text = font.render(f"Diversion: {status}", True, status_color)
+        screen.blit(status_text, (self.width // 2 - 60, 90))
 
         # Draw scale indicator
-        font = pygame.font.Font(None, 20)
-        scale_text = font.render("Scale: 1m = {:.0f}px".format(PPM), True, Colors.LIGHT_GRAY)
+        font_small = pygame.font.Font(None, 20)
+        scale_text = font_small.render("Scale: 1m = {:.0f}px".format(PPM), True, Colors.LIGHT_GRAY)
         screen.blit(scale_text, (10, self.height - 25))
 
         # Draw coordinate info
-        coord_text = font.render("Space: 32m x 18m", True, Colors.LIGHT_GRAY)
+        coord_text = font_small.render("Space: 32m x 18m", True, Colors.LIGHT_GRAY)
         screen.blit(coord_text, (10, self.height - 45))
 
     def run(self):
@@ -897,8 +1175,10 @@ class RobotDestinationGame(Game):
         if button != 1:
             return
 
-        if self.slider.handle_mouse_down(pos):
-            return
+        # Check all sliders
+        for slider in self.sliders:
+            if slider.handle_mouse_down(pos):
+                return
 
         if self.button.is_clicked(pos):
             self.is_moving = not self.is_moving
@@ -913,7 +1193,8 @@ class RobotDestinationGame(Game):
             self.dragged_sprite = self.obstacle
             return
 
-        for sprite in [self.robot, self.destination, self.obstacle]:
+        # Allow dragging robot, destination, obstacle, and diversion point
+        for sprite in [self.robot, self.destination, self.obstacle, self.diversion_point]:
             if sprite.contains_point(pos):
                 sprite.start_drag(pos)
                 self.dragged_sprite = sprite
@@ -924,7 +1205,9 @@ class RobotDestinationGame(Game):
         if button != 1:
             return
 
-        self.slider.handle_mouse_up()
+        # Release all sliders
+        for slider in self.sliders:
+            slider.handle_mouse_up()
 
         if self.dragged_sprite:
             self.dragged_sprite.stop_drag()
