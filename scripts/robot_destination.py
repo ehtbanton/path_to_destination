@@ -4,6 +4,7 @@ Robot Destination script - A robot (blue circle) moves towards a destination (gr
 Features:
 - Blue circle (robot) that moves towards destination when started
 - Green circle (destination) as the target
+- Red rectangle obstacle (draggable, resizable, rotatable)
 - Both sprites are draggable at all times
 - Start/Stop button to control robot movement
 - Speed slider to adjust robot speed
@@ -13,6 +14,191 @@ Features:
 import pygame
 import math
 from engine import Game, Sprite, Colors
+
+
+class Obstacle(Sprite):
+    """
+    A red rectangle obstacle that can be dragged, resized, and rotated.
+
+    Controls:
+    - Left-click drag center: Move the obstacle
+    - Left-click drag corners: Resize the obstacle
+    - Mouse wheel: Rotate the obstacle
+    """
+
+    HANDLE_RADIUS = 8
+    MIN_SIZE = 20
+
+    def __init__(self, x, y, width=120, height=60):
+        super().__init__(x, y, width, height, Colors.RED)
+        self.tag = "obstacle"
+        self.angle = 0  # Rotation angle in degrees
+        self.color = Colors.RED
+
+        # Interaction states
+        self.dragging = False
+        self.resizing = False
+        self.resize_corner = None  # Which corner is being dragged
+        self.drag_offset_x = 0
+        self.drag_offset_y = 0
+
+        self._rebuild_rotated_image()
+
+    def _rebuild_rotated_image(self):
+        """Rebuild the sprite image with current rotation."""
+        # Create base rectangle surface
+        base_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        pygame.draw.rect(base_surface, self.color, (0, 0, self.width, self.height))
+
+        # Rotate the surface
+        self._image = pygame.transform.rotate(base_surface, -self.angle)
+        self._custom_image = True
+
+    @property
+    def center(self):
+        """Get the center of the obstacle."""
+        return (self.x + self.width / 2, self.y + self.height / 2)
+
+    @center.setter
+    def center(self, pos):
+        """Set position by center."""
+        self.x = pos[0] - self.width / 2
+        self.y = pos[1] - self.height / 2
+
+    def get_corners(self):
+        """Get the four corners of the rectangle in world space (accounting for rotation)."""
+        cx, cy = self.center
+        hw, hh = self.width / 2, self.height / 2
+
+        # Local corner positions (relative to center)
+        local_corners = [
+            (-hw, -hh),  # Top-left
+            (hw, -hh),   # Top-right
+            (hw, hh),    # Bottom-right
+            (-hw, hh),   # Bottom-left
+        ]
+
+        # Rotate corners around center
+        angle_rad = math.radians(self.angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+
+        world_corners = []
+        for lx, ly in local_corners:
+            # Rotate point
+            rx = lx * cos_a - ly * sin_a
+            ry = lx * sin_a + ly * cos_a
+            # Translate to world
+            world_corners.append((cx + rx, cy + ry))
+
+        return world_corners
+
+    def contains_point(self, pos):
+        """Check if a point is inside the rotated rectangle."""
+        # Transform point to local space (unrotated)
+        cx, cy = self.center
+        px, py = pos[0] - cx, pos[1] - cy
+
+        # Rotate point in opposite direction
+        angle_rad = math.radians(-self.angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+
+        local_x = px * cos_a - py * sin_a
+        local_y = px * sin_a + py * cos_a
+
+        # Check if inside unrotated rectangle
+        hw, hh = self.width / 2, self.height / 2
+        return -hw <= local_x <= hw and -hh <= local_y <= hh
+
+    def get_corner_at_point(self, pos):
+        """Check if point is near a corner handle. Returns corner index or None."""
+        corners = self.get_corners()
+        for i, corner in enumerate(corners):
+            dx = pos[0] - corner[0]
+            dy = pos[1] - corner[1]
+            if dx * dx + dy * dy <= self.HANDLE_RADIUS * self.HANDLE_RADIUS * 4:
+                return i
+        return None
+
+    def start_drag(self, mouse_pos):
+        """Start dragging the obstacle."""
+        # Check if dragging a corner for resize
+        corner = self.get_corner_at_point(mouse_pos)
+        if corner is not None:
+            self.resizing = True
+            self.resize_corner = corner
+        else:
+            self.dragging = True
+            self.drag_offset_x = self.x - mouse_pos[0]
+            self.drag_offset_y = self.y - mouse_pos[1]
+
+    def stop_drag(self):
+        """Stop dragging/resizing."""
+        self.dragging = False
+        self.resizing = False
+        self.resize_corner = None
+
+    def update_drag(self, mouse_pos):
+        """Update position or size while being dragged."""
+        if self.dragging:
+            self.x = mouse_pos[0] + self.drag_offset_x
+            self.y = mouse_pos[1] + self.drag_offset_y
+        elif self.resizing and self.resize_corner is not None:
+            self._handle_resize(mouse_pos)
+
+    def _handle_resize(self, mouse_pos):
+        """Handle resizing from a corner."""
+        cx, cy = self.center
+
+        # Get mouse position in local (unrotated) space
+        px, py = mouse_pos[0] - cx, mouse_pos[1] - cy
+        angle_rad = math.radians(-self.angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        local_x = px * cos_a - py * sin_a
+        local_y = px * sin_a + py * cos_a
+
+        # Calculate new size based on which corner is being dragged
+        # Corners: 0=TL, 1=TR, 2=BR, 3=BL
+        if self.resize_corner in [1, 2]:  # Right side
+            new_width = max(self.MIN_SIZE, abs(local_x) * 2)
+        else:  # Left side
+            new_width = max(self.MIN_SIZE, abs(local_x) * 2)
+
+        if self.resize_corner in [2, 3]:  # Bottom side
+            new_height = max(self.MIN_SIZE, abs(local_y) * 2)
+        else:  # Top side
+            new_height = max(self.MIN_SIZE, abs(local_y) * 2)
+
+        # Update size while keeping center fixed
+        old_center = self.center
+        self.width = new_width
+        self.height = new_height
+        self.center = old_center
+        self._rebuild_rotated_image()
+
+    def rotate(self, delta_angle):
+        """Rotate the obstacle by delta degrees."""
+        self.angle = (self.angle + delta_angle) % 360
+        self._rebuild_rotated_image()
+
+    def draw(self, screen):
+        """Draw the obstacle with rotation and corner handles."""
+        # Draw the rotated rectangle
+        corners = self.get_corners()
+        pygame.draw.polygon(screen, self.color, corners)
+        pygame.draw.polygon(screen, Colors.WHITE, corners, 2)
+
+        # Draw corner handles
+        for corner in corners:
+            pygame.draw.circle(screen, Colors.WHITE, (int(corner[0]), int(corner[1])), self.HANDLE_RADIUS)
+            pygame.draw.circle(screen, Colors.RED, (int(corner[0]), int(corner[1])), self.HANDLE_RADIUS - 2)
+
+    def _draw(self, screen):
+        """Override default draw to use custom rotation drawing."""
+        if self.visible:
+            self.draw(screen)
 
 
 class Path:
@@ -362,6 +548,7 @@ class RobotDestinationGame(Game):
         super().__init__(width, height, title, fps)
         self.robot = None
         self.destination = None
+        self.obstacle = None
         self.button = None
         self.slider = None
         self.is_moving = False
@@ -377,6 +564,10 @@ class RobotDestinationGame(Game):
         # Create destination (green circle) in the right area
         self.destination = Destination(self.width - 200, self.height // 2 - 25)
         self.add(self.destination)
+
+        # Create obstacle (red rectangle) in the center
+        self.obstacle = Obstacle(self.width // 2 - 60, self.height // 2 - 30, 120, 60)
+        self.add(self.obstacle)
 
         # Link robot to destination
         self.robot.destination = self.destination
@@ -394,9 +585,10 @@ class RobotDestinationGame(Game):
 
         print("Robot Destination Game")
         print("- Drag the blue robot or green destination anywhere")
+        print("- Drag the red obstacle to move it, drag corners to resize")
+        print("- Mouse wheel over obstacle to rotate it")
         print("- Click Start to make the robot follow the path")
         print("- Use the slider to adjust robot speed")
-        print("- Path updates dynamically as you drag!")
 
     def on_update(self, dt):
         mouse_pos = pygame.mouse.get_pos()
@@ -462,6 +654,8 @@ class RobotDestinationGame(Game):
                     self._handle_mouse_down(event.pos, event.button)
                 elif event.type == pygame.MOUSEBUTTONUP:
                     self._handle_mouse_up(event.pos, event.button)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._handle_mouse_wheel(event.y)
 
             # Update sprites
             for sprite in self._sprites:
@@ -515,8 +709,15 @@ class RobotDestinationGame(Game):
             self.button.hover_color = (200, 0, 0) if self.is_moving else (0, 200, 0)
             return
 
-        # Check sprite dragging (robot has priority if overlapping)
-        for sprite in [self.robot, self.destination]:
+        # Check sprite dragging (obstacle corners first, then robot, then others)
+        # Check obstacle corners first for resize
+        if self.obstacle.get_corner_at_point(pos) is not None:
+            self.obstacle.start_drag(pos)
+            self.dragged_sprite = self.obstacle
+            return
+
+        # Then check all sprites for drag
+        for sprite in [self.robot, self.destination, self.obstacle]:
             if sprite.contains_point(pos):
                 sprite.start_drag(pos)
                 self.dragged_sprite = sprite
@@ -533,6 +734,15 @@ class RobotDestinationGame(Game):
         if self.dragged_sprite:
             self.dragged_sprite.stop_drag()
             self.dragged_sprite = None
+
+    def _handle_mouse_wheel(self, scroll_y):
+        """Handle mouse wheel for obstacle rotation."""
+        mouse_pos = pygame.mouse.get_pos()
+
+        # Rotate obstacle if mouse is over it
+        if self.obstacle.contains_point(mouse_pos) or self.obstacle.get_corner_at_point(mouse_pos) is not None:
+            rotation_speed = 5  # Degrees per scroll tick
+            self.obstacle.rotate(scroll_y * rotation_speed)
 
 
 def create_game():
