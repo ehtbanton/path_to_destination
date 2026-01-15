@@ -479,66 +479,54 @@ class DiversionPoint(CircleSprite):
             radius = meters_to_pixels(0.3)
         super().__init__(x, y, radius, Colors.ORANGE)
         self.tag = "diversion"
-        self.base_speed = meters_to_pixels(10.0)  # Base movement speed (5x faster)
+        self.base_angular_speed = 90.0  # Degrees per second
         self.overlap_sum = 0.0  # Current proximity overlap value
         self.robot_facing = 0  # Robot's facing angle
-        self.sensitivity = 1.0  # Sensitivity multiplier for movement
+        self.sensitivity = 10.0  # Sensitivity multiplier for movement
         self.active = False  # Whether diversion is active (obstacle detected)
-        self.damping = 0.95  # Velocity damping when no overlap
-        self.velocity_x = 0
-        self.velocity_y = 0
-        self.lead_distance = meters_to_pixels(3.0)  # How far ahead of robot to position
-        self.perpendicular_offset = 0  # Accumulated perpendicular offset from path
+        self.damping = 0.85  # Angular damping when no overlap (lower = faster return)
+        self.fixed_radius = meters_to_pixels(3.0)  # Fixed distance from robot
+        self.angular_offset = 0  # Degrees offset from path direction (positive = right, negative = left)
 
     def update_from_overlap(self, overlap_sum, robot_facing, robot_center, destination_center, dt):
-        """Update position based on proximity overlap sum."""
+        """Update position based on proximity overlap sum. Stays at fixed radius from robot."""
         self.overlap_sum = overlap_sum
         self.robot_facing = robot_facing
 
-        # Calculate direction from robot to destination
+        # Calculate base angle from robot to destination
         dx = destination_center[0] - robot_center[0]
         dy = destination_center[1] - robot_center[1]
         dist_to_dest = math.sqrt(dx * dx + dy * dy)
 
         if dist_to_dest > 1:
-            # Normalize direction
-            dir_x = dx / dist_to_dest
-            dir_y = dy / dist_to_dest
+            # Base angle pointing towards destination
+            base_angle = math.degrees(math.atan2(dy, dx))
 
-            # Base position: lead_distance ahead of robot along path to destination
-            # But cap it so it doesn't go past the destination
-            actual_lead = min(self.lead_distance, dist_to_dest * 0.8)
-            base_x = robot_center[0] + dir_x * actual_lead
-            base_y = robot_center[1] + dir_y * actual_lead
-
-            # Perpendicular direction (90 degrees to the path)
-            perp_x = -dir_y
-            perp_y = dir_x
-
+            # Angular speed scales with overlap magnitude
             if abs(overlap_sum) > 0.001:
                 self.active = True
 
-                # Speed proportional to overlap sum magnitude
-                speed = self.base_speed * abs(overlap_sum) * self.sensitivity
-
                 # Direction based on sign of overlap
-                # Negative overlap (obstacle on left) -> move right (positive perpendicular)
-                # Positive overlap (obstacle on right) -> move left (negative perpendicular)
+                # Negative overlap (obstacle on left) -> rotate right (positive angle)
+                # Positive overlap (obstacle on right) -> rotate left (negative angle)
                 direction = -1 if overlap_sum > 0 else 1
 
-                # Accumulate perpendicular offset
-                self.perpendicular_offset += direction * speed * dt
+                # Angular speed proportional to overlap magnitude
+                angular_speed = self.base_angular_speed * abs(overlap_sum) * self.sensitivity
+                self.angular_offset += direction * angular_speed * dt
             else:
-                # Dampen perpendicular offset back towards zero when no overlap
-                self.perpendicular_offset *= self.damping
+                # Dampen angular offset back towards zero when no overlap
+                # Lower damping value = faster return to center
+                self.angular_offset *= self.damping
 
-                if abs(self.perpendicular_offset) < 1:
+                if abs(self.angular_offset) < 0.5:
                     self.active = False
-                    self.perpendicular_offset = 0
+                    self.angular_offset = 0
 
-            # Final position: base position + perpendicular offset
-            final_x = base_x + perp_x * self.perpendicular_offset
-            final_y = base_y + perp_y * self.perpendicular_offset
+            # Calculate final position at fixed radius with angular offset
+            final_angle = math.radians(base_angle + self.angular_offset)
+            final_x = robot_center[0] + self.fixed_radius * math.cos(final_angle)
+            final_y = robot_center[1] + self.fixed_radius * math.sin(final_angle)
 
             # Set position (adjusting for sprite origin being top-left)
             self.x = final_x - self.radius
@@ -551,14 +539,11 @@ class DiversionPoint(CircleSprite):
         dist_to_dest = math.sqrt(dx * dx + dy * dy)
 
         if dist_to_dest > 1:
-            dir_x = dx / dist_to_dest
-            dir_y = dy / dist_to_dest
-            actual_lead = min(self.lead_distance, dist_to_dest * 0.8)
+            angle = math.atan2(dy, dx)
+            self.x = robot_center[0] + self.fixed_radius * math.cos(angle) - self.radius
+            self.y = robot_center[1] + self.fixed_radius * math.sin(angle) - self.radius
 
-            self.x = robot_center[0] + dir_x * actual_lead - self.radius
-            self.y = robot_center[1] + dir_y * actual_lead - self.radius
-
-        self.perpendicular_offset = 0
+        self.angular_offset = 0
         self.active = False
 
     def draw_diversion(self, screen):
@@ -578,12 +563,12 @@ class DiversionPoint(CircleSprite):
         pygame.draw.circle(screen, Colors.ORANGE, (int_cx, int_cy), int_radius)
         pygame.draw.circle(screen, Colors.WHITE, (int_cx, int_cy), int_radius, 2)
 
-        # Draw offset indicator showing perpendicular displacement
-        if abs(self.perpendicular_offset) > 5:
-            # Draw a small bar showing the offset magnitude
-            bar_length = min(30, abs(self.perpendicular_offset) * 0.3)
-            bar_color = Colors.CYAN if self.perpendicular_offset > 0 else Colors.MAGENTA
-            pygame.draw.circle(screen, bar_color, (int_cx, int_cy), int(bar_length / 3) + 2)
+        # Draw offset indicator showing angular displacement
+        if abs(self.angular_offset) > 2:
+            # Draw inner color showing direction of offset
+            bar_color = Colors.CYAN if self.angular_offset > 0 else Colors.MAGENTA
+            inner_radius = max(3, int(min(abs(self.angular_offset) / 10, int_radius - 2)))
+            pygame.draw.circle(screen, bar_color, (int_cx, int_cy), inner_radius)
 
     def _draw(self, screen):
         """Override to use custom drawing."""
@@ -1001,19 +986,19 @@ class RobotDestinationGame(Game):
         # Left side sliders
         self.speed_slider = Slider(
             left_x, 80, slider_width, slider_height,
-            0.5, 8.0, 2.0, "Speed", " m/s"
+            0.5, 5.0, 2.0, "Speed", " m/s"
         )
         self.sliders.append(self.speed_slider)
 
         self.sensitivity_slider = Slider(
             left_x, 130, slider_width, slider_height,
-            0.1, 5.0, 1.0, "Sensitivity", "x"
+            2.0, 20.0, 5.0, "Sensitivity", "x"
         )
         self.sliders.append(self.sensitivity_slider)
 
         self.damping_slider = Slider(
             left_x, 180, slider_width, slider_height,
-            0.8, 0.99, 0.95, "Damping", ""
+            0.9, 0.999, 0.99, "Damping", ""
         )
         self.sliders.append(self.damping_slider)
 
@@ -1036,11 +1021,11 @@ class RobotDestinationGame(Game):
         )
         self.sliders.append(self.num_points_slider)
 
-        self.lead_dist_slider = Slider(
+        self.radius_slider = Slider(
             right_x, 230, slider_width, slider_height,
-            1.0, 8.0, 3.0, "Lead Dist", " m"
+            1.0, 8.0, 3.0, "Radius", " m"
         )
-        self.sliders.append(self.lead_dist_slider)
+        self.sliders.append(self.radius_slider)
 
         # Initialize diversion point position
         self.diversion_point.reset_to_path(self.robot.center, self.destination.center)
@@ -1069,7 +1054,7 @@ class RobotDestinationGame(Game):
 
         self.diversion_point.sensitivity = self.sensitivity_slider.value
         self.diversion_point.damping = self.damping_slider.value
-        self.diversion_point.lead_distance = meters_to_pixels(self.lead_dist_slider.value)
+        self.diversion_point.fixed_radius = meters_to_pixels(self.radius_slider.value)
 
         if self.dragged_sprite:
             self.dragged_sprite.update_drag(mouse_pos)
