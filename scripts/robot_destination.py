@@ -13,6 +13,7 @@ Features:
 
 import pygame
 import math
+import random
 from engine import Game, Sprite, Colors
 
 
@@ -131,18 +132,22 @@ class ProximityCloud:
     def get_obstacle_overlap_sum(self, obstacle):
         """
         Calculate the sum of proximity values for points that overlap with the obstacle.
-        Returns a signed value: positive means obstacle is on right, negative means left.
+        Returns a tuple: (signed_sum, absolute_sum)
+        - signed_sum: positive means obstacle is on right, negative means left
+        - absolute_sum: sum of all absolute proximity values (for threshold detection)
         """
         if obstacle is None:
-            return 0.0
+            return 0.0, 0.0
 
-        total = 0.0
+        signed_total = 0.0
+        abs_total = 0.0
         for point in self.points:
             point.overlapping = obstacle.contains_point(point.position)
             if point.overlapping:
-                total += point.proximity
+                signed_total += point.proximity
+                abs_total += abs(point.proximity)
 
-        return total
+        return signed_total, abs_total
 
     def draw(self, screen, show_values=True):
         """Draw the proximity cloud with static visual indicators."""
@@ -482,13 +487,18 @@ class DiversionPoint(CircleSprite):
         self.base_angular_speed = 90.0  # Degrees per second
         self.overlap_sum = 0.0  # Current proximity overlap value
         self.robot_facing = 0  # Robot's facing angle
-        self.sensitivity = 10.0  # Sensitivity multiplier for movement
+        self.sensitivity = 20.0  # Sensitivity multiplier for movement
         self.active = False  # Whether diversion is active (obstacle detected)
         self.damping = 0.85  # Angular damping when no overlap (lower = faster return)
         self.fixed_radius = meters_to_pixels(3.0)  # Fixed distance from robot
         self.angular_offset = 0  # Degrees offset from path direction (positive = right, negative = left)
 
-    def update_from_overlap(self, overlap_sum, robot_facing, robot_center, destination_center, dt):
+        # Burst feature - one-time acceleration when overlap exceeds threshold
+        self.burst_threshold = 1.0  # Threshold for absolute overlap sum
+        self.burst_triggered = False  # Whether burst has been triggered
+        self.burst_acceleration = 30.0  # Degrees to add on burst
+
+    def update_from_overlap(self, overlap_sum, abs_overlap_sum, robot_facing, robot_center, destination_center, dt):
         """Update position based on proximity overlap sum. Stays at fixed radius from robot."""
         self.overlap_sum = overlap_sum
         self.robot_facing = robot_facing
@@ -501,6 +511,17 @@ class DiversionPoint(CircleSprite):
         if dist_to_dest > 1:
             # Base angle pointing towards destination
             base_angle = math.degrees(math.atan2(dy, dx))
+
+            # Check for burst trigger - one-time acceleration when absolute overlap exceeds threshold
+            if abs_overlap_sum >= self.burst_threshold and not self.burst_triggered:
+                self.burst_triggered = True
+                # Randomly pick left or right
+                burst_direction = random.choice([-1, 1])
+                self.angular_offset += burst_direction * self.burst_acceleration
+
+            # Reset burst trigger when overlap drops below threshold
+            if abs_overlap_sum < self.burst_threshold * 0.5:
+                self.burst_triggered = False
 
             # Angular speed scales with overlap magnitude
             if abs(overlap_sum) > 0.001:
@@ -729,12 +750,13 @@ class Robot(CircleSprite):
         )
 
         # Calculate overlap sum with obstacle
-        self.overlap_sum = self.proximity_cloud.get_obstacle_overlap_sum(self.obstacle)
+        self.overlap_sum, self.abs_overlap_sum = self.proximity_cloud.get_obstacle_overlap_sum(self.obstacle)
 
         # Update diversion point based on overlap
         if self.diversion_point is not None and self.destination is not None:
             self.diversion_point.update_from_overlap(
                 self.overlap_sum,
+                self.abs_overlap_sum,
                 self.facing_angle,
                 self.center,
                 self.destination.center,
@@ -950,10 +972,13 @@ class RobotDestinationGame(Game):
         self.destination = Destination(dest_x, dest_y)
         self.add(self.destination)
 
-        # Create obstacle at center (16m, 9m)
-        obs_x = meters_to_pixels(16.0) - meters_to_pixels(1.5)
-        obs_y = meters_to_pixels(9.0) - meters_to_pixels(0.75)
-        self.obstacle = Obstacle(obs_x, obs_y)
+        # Create obstacle at center, slightly below middle
+        obs_width = meters_to_pixels(4.0)
+        obs_height = meters_to_pixels(2.0)
+        obs_x = meters_to_pixels(16.0) - obs_width / 2
+        obs_y = meters_to_pixels(10.5) - obs_height / 2
+        self.obstacle = Obstacle(obs_x, obs_y, obs_width, obs_height)
+        self.obstacle.angle = 15  # Tilt slightly
         self.add(self.obstacle)
 
         # Create diversion point (will be positioned along path to destination)
@@ -986,7 +1011,7 @@ class RobotDestinationGame(Game):
 
         self.sensitivity_slider = Slider(
             left_x, 130, slider_width, slider_height,
-            2.0, 20.0, 5.0, "Sensitivity", "x"
+            0.0, 100.0, 20.0, "Sensitivity", "x"
         )
         self.sliders.append(self.sensitivity_slider)
 
@@ -995,6 +1020,12 @@ class RobotDestinationGame(Game):
             0.9, 0.999, 0.99, "Damping", ""
         )
         self.sliders.append(self.damping_slider)
+
+        self.burst_threshold_slider = Slider(
+            left_x, 230, slider_width, slider_height,
+            0.1, 5.0, 1.0, "Burst Thresh", ""
+        )
+        self.sliders.append(self.burst_threshold_slider)
 
         # Right side sliders
         self.fov_angle_slider = Slider(
@@ -1049,6 +1080,7 @@ class RobotDestinationGame(Game):
         self.diversion_point.sensitivity = self.sensitivity_slider.value
         self.diversion_point.damping = self.damping_slider.value
         self.diversion_point.fixed_radius = meters_to_pixels(self.radius_slider.value)
+        self.diversion_point.burst_threshold = self.burst_threshold_slider.value
 
         if self.dragged_sprite:
             self.dragged_sprite.update_drag(mouse_pos)
