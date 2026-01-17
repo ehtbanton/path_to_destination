@@ -195,10 +195,10 @@ class Obstacle(Sprite):
             width = meters_to_pixels(3.0)
         if height is None:
             height = meters_to_pixels(1.5)
-        super().__init__(x, y, width, height, Colors.RED)
+        super().__init__(x, y, width, height, (128, 0, 128))  # Purple
         self.tag = "obstacle"
         self.angle = 0  # Rotation angle in degrees
-        self.color = Colors.RED
+        self.color = (128, 0, 128)  # Purple
 
         # Interaction states
         self.dragging = False
@@ -401,12 +401,13 @@ class Path:
 
         return self.waypoints[-1] if self.waypoints else None
 
-    def draw(self, screen):
+    def draw(self, screen, color=None):
         """Draw the path as a dotted line."""
+        draw_color = color if color is not None else self.dot_color
         for waypoint in self.waypoints:
             pygame.draw.circle(
                 screen,
-                self.dot_color,
+                draw_color,
                 (int(waypoint[0]), int(waypoint[1])),
                 self.dot_radius
             )
@@ -615,8 +616,9 @@ class DiversionPoint(CircleSprite):
 class Robot(CircleSprite):
     """The blue robot circle with FOV vision that follows a computed path."""
 
-    FOV_ANGLE = 70  # Degrees
+    FOV_ANGLE = 70  # Degrees (for proximity cloud)
     FOV_RANGE_METERS = 4.0  # 4 meters ahead
+    DEST_FOV_ANGLE = 120  # Degrees (for destination visibility)
 
     def __init__(self, x, y, radius=None):
         if radius is None:
@@ -636,6 +638,10 @@ class Robot(CircleSprite):
         self.diversion_point = None  # Will be set by game
         self.overlap_sum = 0.0  # Current overlap value for display
         self.show_proximity_cloud = True  # Toggle for visibility
+
+        # Destination visibility tracking
+        self.last_known_destination = None  # Last known destination position (x, y)
+        self.destination_visible = False  # Whether destination is currently in FOV
 
     def get_fov_triangle(self):
         """Get the three points of the FOV vision triangle."""
@@ -724,15 +730,68 @@ class Robot(CircleSprite):
 
         return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
 
+    def is_point_in_dest_fov(self, point):
+        """Check if a point is within the destination visibility FOV (no range limit)."""
+        cx, cy = self.center
+        px, py = point
+
+        # Calculate angle from robot to point
+        dx = px - cx
+        dy = py - cy
+
+        if dx == 0 and dy == 0:
+            return True  # Point is at robot center
+
+        angle_to_point = math.degrees(math.atan2(dy, dx))
+
+        # Calculate angle difference, normalized to -180..180
+        angle_diff = angle_to_point - self.facing_angle
+        while angle_diff > 180:
+            angle_diff -= 360
+        while angle_diff < -180:
+            angle_diff += 360
+
+        # Check if within half the FOV angle on either side
+        half_fov = self.DEST_FOV_ANGLE / 2
+        return abs(angle_diff) <= half_fov
+
+    def update_destination_visibility(self):
+        """Update whether the destination is visible and track last known position."""
+        if self.destination is None:
+            self.destination_visible = False
+            return
+
+        # Check if destination center is in the destination FOV
+        self.destination_visible = self.is_point_in_dest_fov(self.destination.center)
+
+        # If visible, update last known position
+        if self.destination_visible:
+            self.last_known_destination = self.destination.center
+
+    def get_perceived_destination(self):
+        """Get the destination position as perceived by the robot."""
+        if self.destination_visible:
+            return self.destination.center
+        elif self.last_known_destination is not None:
+            return self.last_known_destination
+        else:
+            # Fallback to actual destination if we've never seen it
+            return self.destination.center if self.destination else None
+
     def update_path(self):
         """Recompute the path through diversion point."""
         if self.destination is None:
             return
 
-        # Path always goes through diversion point: robot -> diversion -> destination
+        # Use perceived destination (actual if visible, last known otherwise)
+        perceived_dest = self.get_perceived_destination()
+        if perceived_dest is None:
+            return
+
+        # Path always goes through diversion point: robot -> diversion -> perceived destination
         self.path.compute(
             self.center,
-            self.destination.center,
+            perceived_dest,
             self.diversion_point
         )
 
@@ -740,6 +799,9 @@ class Robot(CircleSprite):
         self.fov_sees_obstacle = self.check_fov_obstacle_collision(self.obstacle)
 
     def on_update(self, dt):
+        # Update destination visibility tracking
+        self.update_destination_visibility()
+
         # Generate proximity cloud in FOV
         fov_range = meters_to_pixels(self.FOV_RANGE_METERS)
         self.proximity_cloud.generate(
@@ -752,14 +814,15 @@ class Robot(CircleSprite):
         # Calculate overlap sum with obstacle
         self.overlap_sum, self.abs_overlap_sum = self.proximity_cloud.get_obstacle_overlap_sum(self.obstacle)
 
-        # Update diversion point based on overlap
-        if self.diversion_point is not None and self.destination is not None:
+        # Update diversion point based on overlap (using perceived destination)
+        perceived_dest = self.get_perceived_destination()
+        if self.diversion_point is not None and perceived_dest is not None:
             self.diversion_point.update_from_overlap(
                 self.overlap_sum,
                 self.abs_overlap_sum,
                 self.facing_angle,
                 self.center,
-                self.destination.center,
+                perceived_dest,
                 dt
             )
 
@@ -783,17 +846,44 @@ class Robot(CircleSprite):
                     self.x += (dx / distance) * self.speed * dt
                     self.y += (dy / distance) * self.speed * dt
         elif not self.moving and self.destination:
-            # When stopped, face towards destination
-            dx = self.destination.center[0] - self.center[0]
-            dy = self.destination.center[1] - self.center[1]
-            if dx != 0 or dy != 0:
-                self.facing_angle = math.degrees(math.atan2(dy, dx))
+            # When stopped, face towards perceived destination
+            perceived_dest = self.get_perceived_destination()
+            if perceived_dest:
+                dx = perceived_dest[0] - self.center[0]
+                dy = perceived_dest[1] - self.center[1]
+                if dx != 0 or dy != 0:
+                    self.facing_angle = math.degrees(math.atan2(dy, dx))
 
     def draw_fov(self, screen):
-        """Draw the proximity cloud."""
+        """Draw the proximity cloud and destination FOV indicators."""
         # Draw proximity cloud
         if self.show_proximity_cloud:
             self.proximity_cloud.draw(screen)
+
+        # Draw destination FOV indicator lines (2 short lines showing the FOV boundaries)
+        cx, cy = self.center
+        fov_line_length = meters_to_pixels(2.0)  # 2 meter lines
+        half_fov = self.DEST_FOV_ANGLE / 2
+        angle_rad = math.radians(self.facing_angle)
+
+        # Left boundary of dest FOV
+        left_angle = angle_rad - math.radians(half_fov)
+        left_end = (
+            cx + fov_line_length * math.cos(left_angle),
+            cy + fov_line_length * math.sin(left_angle)
+        )
+
+        # Right boundary of dest FOV
+        right_angle = angle_rad + math.radians(half_fov)
+        right_end = (
+            cx + fov_line_length * math.cos(right_angle),
+            cy + fov_line_length * math.sin(right_angle)
+        )
+
+        # Draw the FOV boundary lines (cyan/turquoise color)
+        fov_color = (0, 200, 200)  # Turquoise
+        pygame.draw.line(screen, fov_color, (int(cx), int(cy)), (int(left_end[0]), int(left_end[1])), 2)
+        pygame.draw.line(screen, fov_color, (int(cx), int(cy)), (int(right_end[0]), int(right_end[1])), 2)
 
     def draw_robot(self, screen):
         """Draw the robot with facing direction indicator."""
@@ -823,7 +913,12 @@ class Robot(CircleSprite):
 
     def draw_path(self, screen):
         """Draw the path visualization."""
-        self.path.draw(screen)
+        # Use turquoise when using stale destination data
+        if not self.destination_visible and self.last_known_destination is not None:
+            stale_color = (0, 200, 200)  # Turquoise
+            self.path.draw(screen, stale_color)
+        else:
+            self.path.draw(screen)
 
     def _draw(self, screen):
         """Override to use custom drawing."""
@@ -837,7 +932,7 @@ class Destination(CircleSprite):
     def __init__(self, x, y, radius=None):
         if radius is None:
             radius = meters_to_pixels(0.4)  # 0.4m radius
-        super().__init__(x, y, radius, Colors.GREEN)
+        super().__init__(x, y, radius, Colors.WHITE)
         self.tag = "destination"
 
 
@@ -973,12 +1068,12 @@ class RobotDestinationGame(Game):
         self.add(self.destination)
 
         # Create obstacle at center, slightly below middle
-        obs_width = meters_to_pixels(4.0)
-        obs_height = meters_to_pixels(2.0)
+        obs_width = meters_to_pixels(8.0)
+        obs_height = meters_to_pixels(12.0)
         obs_x = meters_to_pixels(16.0) - obs_width / 2
         obs_y = meters_to_pixels(10.5) - obs_height / 2
         self.obstacle = Obstacle(obs_x, obs_y, obs_width, obs_height)
-        self.obstacle.angle = 15  # Tilt slightly
+        self.obstacle.angle = 5  # Tilt slightly
         self.add(self.obstacle)
 
         # Create diversion point (will be positioned along path to destination)
@@ -1052,6 +1147,12 @@ class RobotDestinationGame(Game):
         )
         self.sliders.append(self.radius_slider)
 
+        self.dest_fov_slider = Slider(
+            right_x, 280, slider_width, slider_height,
+            30, 360, 120, "Dest FOV", "°"
+        )
+        self.sliders.append(self.dest_fov_slider)
+
         # Initialize diversion point position
         self.diversion_point.reset_to_path(self.robot.center, self.destination.center)
 
@@ -1075,6 +1176,7 @@ class RobotDestinationGame(Game):
         self.robot.speed = meters_to_pixels(self.speed_slider.value)
         self.robot.FOV_ANGLE = self.fov_angle_slider.value
         self.robot.FOV_RANGE_METERS = self.fov_range_slider.value
+        self.robot.DEST_FOV_ANGLE = self.dest_fov_slider.value
         self.robot.proximity_cloud.num_points = int(self.num_points_slider.value)
 
         self.diversion_point.sensitivity = self.sensitivity_slider.value
