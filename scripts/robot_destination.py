@@ -523,6 +523,21 @@ class DiversionPoint(CircleSprite):
                     self.active = False
                     self.angular_offset = 0
 
+            # Clamp angular_offset to keep final angle within +/-90 degrees of robot facing
+            # Normalize the difference between base_angle and robot_facing to -180..180
+            angle_diff = base_angle - robot_facing
+            while angle_diff > 180:
+                angle_diff -= 360
+            while angle_diff < -180:
+                angle_diff += 360
+
+            # final_angle = base_angle + angular_offset
+            # We want: robot_facing - 90 <= final_angle <= robot_facing + 90
+            # So: -90 - angle_diff <= angular_offset <= 90 - angle_diff
+            min_offset = -90 - angle_diff
+            max_offset = 90 - angle_diff
+            self.angular_offset = max(min_offset, min(max_offset, self.angular_offset))
+
             # Calculate final position at fixed radius with angular offset
             final_angle = math.radians(base_angle + self.angular_offset)
             final_x = robot_center[0] + self.fixed_radius * math.cos(final_angle)
@@ -753,29 +768,8 @@ class Robot(CircleSprite):
                 self.facing_angle = math.degrees(math.atan2(dy, dx))
 
     def draw_fov(self, screen):
-        """Draw the FOV vision triangle and proximity cloud."""
-        fov_triangle = self.get_fov_triangle()
-
-        # Create translucent surface for FOV
-        fov_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-
-        # Choose color based on whether obstacle is detected
-        if self.fov_sees_obstacle:
-            fov_color = (255, 100, 100, 40)  # Red tint when seeing obstacle (reduced alpha)
-        else:
-            fov_color = (100, 200, 255, 40)  # Blue tint normally (reduced alpha)
-
-        # Draw filled triangle
-        int_triangle = [(int(p[0]), int(p[1])) for p in fov_triangle]
-        pygame.draw.polygon(fov_surface, fov_color, int_triangle)
-
-        # Draw outline
-        outline_color = (255, 255, 255, 150)
-        pygame.draw.polygon(fov_surface, outline_color, int_triangle, 2)
-
-        screen.blit(fov_surface, (0, 0))
-
-        # Draw proximity cloud on top
+        """Draw the proximity cloud."""
+        # Draw proximity cloud
         if self.show_proximity_cloud:
             self.proximity_cloud.draw(screen)
 
