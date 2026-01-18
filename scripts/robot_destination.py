@@ -649,6 +649,10 @@ class Robot(CircleSprite):
         # Waiting state - robot waits at waypoint until next target is visible
         self.waiting_for_target = False
 
+        # Gravity - pulls robot directly towards target when close and in line of sight
+        self.gravity_strength = 0.5  # 0-1, how much gravity overrides obstacle avoidance
+        self.gravity_range = meters_to_pixels(3.0)  # Distance at which gravity starts
+
     def get_fov_triangle(self):
         """Get the three points of the FOV vision triangle."""
         cx, cy = self.center
@@ -925,21 +929,59 @@ class Robot(CircleSprite):
             self.update_path()
 
         if self.moving and self.destination and not self.dragging and not self.waiting_for_target:
-            # Always follow the path (which goes through diversion point)
-            target = self.path.get_next_waypoint(self.center)
+            # Get path waypoint direction (through diversion point)
+            path_target = self.path.get_next_waypoint(self.center)
 
-            if target and not self.path.is_complete(self.center):
-                dx = target[0] - self.center[0]
-                dy = target[1] - self.center[1]
-                distance = math.sqrt(dx * dx + dy * dy)
+            if path_target and not self.path.is_complete(self.center):
+                # Direction to path waypoint
+                path_dx = path_target[0] - self.center[0]
+                path_dy = path_target[1] - self.center[1]
+                path_dist = math.sqrt(path_dx * path_dx + path_dy * path_dy)
 
-                if distance > meters_to_pixels(0.1):
+                if path_dist > meters_to_pixels(0.1):
+                    # Normalize path direction
+                    path_dx /= path_dist
+                    path_dy /= path_dist
+
+                    # Get direct direction to current target (waypoint or destination)
+                    current_target = self.get_current_target()
+                    target_pos = current_target.center if current_target else None
+
+                    # Calculate gravity blend factor
+                    gravity_factor = 0.0
+                    if target_pos and self.gravity_strength > 0:
+                        # Distance to actual target
+                        direct_dx = target_pos[0] - self.center[0]
+                        direct_dy = target_pos[1] - self.center[1]
+                        direct_dist = math.sqrt(direct_dx * direct_dx + direct_dy * direct_dy)
+
+                        # Only apply gravity if in range and direct line of sight
+                        if direct_dist < self.gravity_range and direct_dist > meters_to_pixels(0.1):
+                            if not self.is_line_blocked_by_obstacle(self.center, target_pos):
+                                # Gravity increases as we get closer (inverse distance)
+                                proximity = 1.0 - (direct_dist / self.gravity_range)
+                                gravity_factor = proximity * self.gravity_strength
+
+                                # Normalize direct direction
+                                direct_dx /= direct_dist
+                                direct_dy /= direct_dist
+
+                                # Blend path direction with direct direction
+                                path_dx = path_dx * (1 - gravity_factor) + direct_dx * gravity_factor
+                                path_dy = path_dy * (1 - gravity_factor) + direct_dy * gravity_factor
+
+                                # Re-normalize blended direction
+                                blend_dist = math.sqrt(path_dx * path_dx + path_dy * path_dy)
+                                if blend_dist > 0:
+                                    path_dx /= blend_dist
+                                    path_dy /= blend_dist
+
                     # Update facing angle based on movement direction
-                    self.facing_angle = math.degrees(math.atan2(dy, dx))
+                    self.facing_angle = math.degrees(math.atan2(path_dy, path_dx))
 
-                    # Move towards target
-                    self.x += (dx / distance) * self.speed * dt
-                    self.y += (dy / distance) * self.speed * dt
+                    # Move in blended direction
+                    self.x += path_dx * self.speed * dt
+                    self.y += path_dy * self.speed * dt
         elif not self.moving and self.destination:
             # When stopped, face towards perceived destination
             perceived_dest = self.get_perceived_destination()
@@ -1278,6 +1320,12 @@ class RobotDestinationGame(Game):
         )
         self.sliders.append(self.dest_fov_slider)
 
+        self.gravity_slider = Slider(
+            right_x, 320, slider_width, slider_height,
+            0, 100, 50, "Gravity", "%"
+        )
+        self.sliders.append(self.gravity_slider)
+
         # Initialize diversion point position
         self.diversion_point.reset_to_path(self.robot.center, self.destination.center)
 
@@ -1303,6 +1351,7 @@ class RobotDestinationGame(Game):
         self.robot.FOV_RANGE_METERS = self.fov_range_slider.value
         self.robot.DEST_FOV_ANGLE = self.dest_fov_slider.value
         self.robot.proximity_cloud.num_points = int(self.num_points_slider.value)
+        self.robot.gravity_strength = self.gravity_slider.value / 100.0  # Convert % to 0-1
 
         self.diversion_point.sensitivity = self.sensitivity_slider.value
         self.diversion_point.damping = self.damping_slider.value
