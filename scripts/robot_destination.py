@@ -643,6 +643,12 @@ class Robot(CircleSprite):
         self.last_known_destination = None  # Last known destination position (x, y)
         self.destination_visible = False  # Whether destination is currently in FOV
 
+        # Waypoints (set by game)
+        self.waypoints = None
+
+        # Waiting state - robot waits at waypoint until next target is visible
+        self.waiting_for_target = False
+
     def get_fov_triangle(self):
         """Get the three points of the FOV vision triangle."""
         cx, cy = self.center
@@ -730,6 +736,25 @@ class Robot(CircleSprite):
 
         return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
 
+    def is_line_blocked_by_obstacle(self, start, end):
+        """Check if the line of sight between start and end is blocked by obstacle."""
+        if self.obstacle is None:
+            return False
+
+        # Sample points along the line
+        sx, sy = start
+        ex, ey = end
+        num_samples = 20
+
+        for i in range(1, num_samples):  # Skip start point (robot position)
+            t = i / num_samples
+            px = sx + t * (ex - sx)
+            py = sy + t * (ey - sy)
+            if self.obstacle.contains_point((px, py)):
+                return True
+
+        return False
+
     def is_point_in_dest_fov(self, point):
         """Check if a point is within the destination visibility FOV (no range limit)."""
         cx, cy = self.center
@@ -762,21 +787,65 @@ class Robot(CircleSprite):
             return
 
         # Check if destination center is in the destination FOV
-        self.destination_visible = self.is_point_in_dest_fov(self.destination.center)
+        in_fov = self.is_point_in_dest_fov(self.destination.center)
+
+        # Check if obstacle blocks line of sight
+        blocked = self.is_line_blocked_by_obstacle(self.center, self.destination.center)
+
+        self.destination_visible = in_fov and not blocked
 
         # If visible, update last known position
         if self.destination_visible:
             self.last_known_destination = self.destination.center
 
+    def update_waypoint_visibility(self):
+        """Update visibility for all waypoints."""
+        if not self.waypoints:
+            return
+
+        for waypoint in self.waypoints:
+            # Check if waypoint center is in the destination FOV
+            in_fov = self.is_point_in_dest_fov(waypoint.center)
+
+            # Check if obstacle blocks line of sight
+            blocked = self.is_line_blocked_by_obstacle(self.center, waypoint.center)
+
+            # If visible, update last known position
+            if in_fov and not blocked:
+                waypoint.last_known_position = waypoint.center
+
+    def get_current_target(self):
+        """Get the current navigation target (first waypoint or final destination)."""
+        if self.waypoints and len(self.waypoints) > 0:
+            return self.waypoints[0]
+        return self.destination
+
+    def is_target_visible(self, target):
+        """Check if target (waypoint or destination) is visible."""
+        if target is None:
+            return False
+        in_fov = self.is_point_in_dest_fov(target.center)
+        blocked = self.is_line_blocked_by_obstacle(self.center, target.center)
+        return in_fov and not blocked
+
     def get_perceived_destination(self):
-        """Get the destination position as perceived by the robot."""
-        if self.destination_visible:
-            return self.destination.center
-        elif self.last_known_destination is not None:
+        """Get the current target position as perceived by the robot."""
+        target = self.get_current_target()
+        if target is None:
+            return None
+
+        # Check if this target is visible
+        if self.is_target_visible(target):
+            return target.center
+
+        # Use last known position
+        if hasattr(target, 'last_known_position') and target.last_known_position is not None:
+            return target.last_known_position
+        elif hasattr(target, 'tag') and target.tag == "destination" and self.last_known_destination is not None:
             return self.last_known_destination
-        else:
-            # Fallback to actual destination if we've never seen it
-            return self.destination.center if self.destination else None
+
+        # Fallback to actual position
+        return target.center
 
     def update_path(self):
         """Recompute the path through diversion point."""
@@ -799,8 +868,24 @@ class Robot(CircleSprite):
         self.fov_sees_obstacle = self.check_fov_obstacle_collision(self.obstacle)
 
     def on_update(self, dt):
-        # Update destination visibility tracking
+        # Update destination and waypoint visibility tracking
         self.update_destination_visibility()
+        self.update_waypoint_visibility()
+
+        # Check if robot arrived at current waypoint
+        if self.moving and self.waypoints and len(self.waypoints) > 0:
+            current_waypoint = self.waypoints[0]
+            dx = current_waypoint.center[0] - self.center[0]
+            dy = current_waypoint.center[1] - self.center[1]
+            distance = math.sqrt(dx * dx + dy * dy)
+            arrival_threshold = meters_to_pixels(0.5)  # 0.5m arrival threshold
+            if distance < arrival_threshold:
+                # Remove the reached waypoint
+                self.waypoints.pop(0)
+                current_waypoint.destroy()
+                # Renumber remaining waypoints
+                for i, wp in enumerate(self.waypoints):
+                    wp.number = i + 1
 
         # Generate proximity cloud in FOV
         fov_range = meters_to_pixels(self.FOV_RANGE_METERS)
@@ -826,10 +911,20 @@ class Robot(CircleSprite):
                 dt
             )
 
-        # Update path to go through diversion point
-        self.update_path()
+        # Check if current target is visible before moving
+        current_target = self.get_current_target()
+        target_visible = self.is_target_visible(current_target) if current_target else False
+        self.waiting_for_target = not target_visible
 
-        if self.moving and self.destination and not self.dragging:
+        # Hide diversion point when waiting (direction not decided)
+        if self.diversion_point is not None:
+            self.diversion_point.visible = not self.waiting_for_target
+
+        # Only update path if target is visible (direction decided)
+        if target_visible:
+            self.update_path()
+
+        if self.moving and self.destination and not self.dragging and not self.waiting_for_target:
             # Always follow the path (which goes through diversion point)
             target = self.path.get_next_waypoint(self.center)
 
@@ -913,6 +1008,10 @@ class Robot(CircleSprite):
 
     def draw_path(self, screen):
         """Draw the path visualization."""
+        # Don't draw path when waiting for target to become visible
+        if self.waiting_for_target:
+            return
+
         # Use turquoise when using stale destination data
         if not self.destination_visible and self.last_known_destination is not None:
             stale_color = (0, 200, 200)  # Turquoise
@@ -934,6 +1033,28 @@ class Destination(CircleSprite):
             radius = meters_to_pixels(0.4)  # 0.4m radius
         super().__init__(x, y, radius, Colors.WHITE)
         self.tag = "destination"
+
+
+class Waypoint(CircleSprite):
+    """An intermediary destination point (cyan circle) with number label."""
+
+    def __init__(self, x, y, radius=None, number=1):
+        if radius is None:
+            radius = meters_to_pixels(0.3)  # 0.3m radius, smaller than destination
+        super().__init__(x, y, radius, Colors.CYAN)
+        self.tag = "waypoint"
+        self.last_known_position = None  # For occlusion handling
+        self.number = number  # Display number
+
+    def on_draw(self, screen):
+        """Draw the waypoint with its number."""
+        # Draw the circle (parent draws)
+        super().on_draw(screen)
+        # Draw number in center
+        font = pygame.font.Font(None, 24)
+        text = font.render(str(self.number), True, Colors.BLACK)
+        text_rect = text.get_rect(center=self.center)
+        screen.blit(text, text_rect)
 
 
 class Button:
@@ -1084,6 +1205,10 @@ class RobotDestinationGame(Game):
         self.robot.destination = self.destination
         self.robot.obstacle = self.obstacle
         self.robot.diversion_point = self.diversion_point
+
+        # Initialize waypoints list and link to robot
+        self.waypoints = []
+        self.robot.waypoints = self.waypoints
 
         # Create UI elements
         self.button = Button(
@@ -1285,6 +1410,14 @@ class RobotDestinationGame(Game):
 
     def _handle_mouse_down(self, pos, button):
         """Handle mouse button press."""
+        # Right-click creates a new waypoint
+        if button == 3:
+            number = len(self.waypoints) + 1
+            waypoint = Waypoint(pos[0], pos[1], number=number)
+            self.waypoints.append(waypoint)
+            self.add(waypoint)
+            return
+
         if button != 1:
             return
 
@@ -1305,6 +1438,13 @@ class RobotDestinationGame(Game):
             self.obstacle.start_drag(pos)
             self.dragged_sprite = self.obstacle
             return
+
+        # Check waypoints first (they're on top)
+        for waypoint in self.waypoints:
+            if waypoint.contains_point(pos):
+                waypoint.start_drag(pos)
+                self.dragged_sprite = waypoint
+                return
 
         # Allow dragging robot, destination, obstacle, and diversion point
         for sprite in [self.robot, self.destination, self.obstacle, self.diversion_point]:
